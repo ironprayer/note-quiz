@@ -187,7 +187,7 @@
   - 문제/사용자 데이터 DB 저장
       │              │  HTTP
       ▼              ▼
-[RDB - MySQL]   [Ollama 서버 - 로컬]
+[RDB - H2]      [Ollama 서버 - 로컬]
   - 사용자          - llama3 / mistral
   - 퀴즈            - POST /api/generate
   - 오답 기록
@@ -225,7 +225,7 @@
 | 이미지 OCR | Tesseract (tess4j) |
 | LLM 클라이언트 | Spring WebClient |
 | 스케줄러 | Spring Scheduler (알림/자동 문제 생성) |
-| 데이터베이스 | MySQL + Spring Data JPA |
+| 데이터베이스 | H2 + Spring Data JPA |
 | 빌드 도구 | Gradle 또는 Maven |
 
 ### 로컬 LLM
@@ -243,8 +243,11 @@
 users
   - id, email, password_hash, nickname, created_at
 
+uploads
+  - id, upload_id (UUID), extracted_text (TEXT), created_at
+
 quizzes
-  - id, user_id (nullable), title, source_filename, created_at, share_token
+  - id, user_id (nullable), upload_id, title, source_filename, created_at, share_token
 
 questions
   - id, quiz_id, body, options (JSON), answer, explanation, order_num
@@ -417,3 +420,360 @@ notification_settings
 - 문제 난이도 조절 옵션
 - 학습 통계 및 성장 그래프
 - 팀/그룹 스터디 공유 기능
+
+---
+
+## 15. API 상세 스펙
+
+### 에러 응답 공통 형식
+
+```json
+{
+  "code": "QUIZ_NOT_FOUND",
+  "message": "퀴즈를 찾을 수 없습니다.",
+  "status": 404
+}
+```
+
+### 에러 코드 정의
+
+| 코드 | HTTP 상태 | 설명 |
+|------|-----------|------|
+| `INVALID_FILE_FORMAT` | 400 | 지원하지 않는 파일 형식 |
+| `FILE_TOO_LARGE` | 400 | 파일 크기 초과 (20MB) |
+| `TEXT_EXTRACT_FAILED` | 422 | 텍스트 추출 실패 |
+| `LLM_TIMEOUT` | 504 | LLM 응답 시간 초과 |
+| `QUIZ_NOT_FOUND` | 404 | 퀴즈 없음 |
+| `UNAUTHORIZED` | 401 | 인증 필요 |
+| `FORBIDDEN` | 403 | 접근 권한 없음 |
+| `TOKEN_EXPIRED` | 401 | 액세스 토큰 만료 |
+
+### POST /api/auth/signup
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "password": "Password1!",
+  "nickname": "jeong"
+}
+```
+
+Response `201`:
+```json
+{
+  "userId": 1,
+  "email": "user@example.com",
+  "nickname": "jeong"
+}
+```
+
+### POST /api/auth/login
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "password": "Password1!"
+}
+```
+
+Response `200`:
+```json
+{
+  "accessToken": "eyJ...",
+  "expiresIn": 3600
+}
+```
+
+- Refresh Token은 `HttpOnly` 쿠키로 자동 설정
+
+### POST /api/auth/refresh
+
+- Refresh Token은 쿠키에서 자동 추출
+
+Response `200`:
+```json
+{
+  "accessToken": "eyJ...",
+  "expiresIn": 3600
+}
+```
+
+### POST /api/upload
+
+- Content-Type: `multipart/form-data`
+- Field: `file`
+
+Response `200`:
+```json
+{
+  "uploadId": "abc-123",
+  "filename": "운영체제_정리.pdf",
+  "extractedTextLength": 3420
+}
+```
+
+### POST /api/quiz/generate
+
+Request:
+```json
+{
+  "uploadId": "abc-123",
+  "questionCount": 10
+}
+```
+
+Response `201`:
+```json
+{
+  "quizId": 42,
+  "questions": [
+    {
+      "id": 1,
+      "body": "다음 중 프로세스 스케줄링 알고리즘이 아닌 것은?",
+      "options": ["FCFS", "Round Robin", "LRU", "SJF"],
+      "answer": 3,
+      "explanation": "LRU는 페이지 교체 알고리즘입니다."
+    }
+  ]
+}
+```
+
+### POST /api/quiz/{quizId}/result
+
+Request:
+```json
+{
+  "answers": [
+    { "questionId": 1, "selected": 3 },
+    { "questionId": 2, "selected": 1 }
+  ]
+}
+```
+
+Response `200`:
+```json
+{
+  "resultId": 99,
+  "score": 8,
+  "total": 10,
+  "wrongQuestions": [
+    { "questionId": 3, "selected": 2, "answer": 4 },
+    { "questionId": 7, "selected": 1, "answer": 3 }
+  ]
+}
+```
+
+### POST /api/my/quizzes/{quizId}/share
+
+Response `200`:
+```json
+{
+  "shareToken": "xK92mP",
+  "shareUrl": "/share/xK92mP"
+}
+```
+
+---
+
+## 16. 파일 처리 파이프라인
+
+```
+[클라이언트]
+  └─ multipart/form-data 업로드
+       └─ [Spring Boot] 파일 수신
+            ├─ 확장자 검증 (PDF, PNG, JPG, JPEG)
+            ├─ 크기 검증 (≤ 20MB)
+            └─ 텍스트 추출
+                 ├─ PDF  → Apache PDFBox → 페이지별 텍스트 합산
+                 └─ 이미지 → Tesseract OCR (tess4j, 한국어 + 영어)
+                      └─ 텍스트 정제 (연속 공백·특수문자 정규화)
+                           └─ uploadId 및 추출 텍스트를 DB에 저장
+                                └─ 업로드 완료 응답 반환
+```
+
+- 추출된 텍스트는 `uploads` 테이블에 `uploadId`와 함께 저장
+- OCR 언어팩: `kor + eng` 동시 인식
+
+---
+
+## 17. LLM 연동 상세
+
+### Ollama 호출 방식
+
+- Endpoint: `POST http://localhost:11434/api/generate`
+- 타임아웃: 30초
+- 실패 시 1회 재시도 후 `LLM_TIMEOUT` 에러 반환
+
+### 프롬프트 템플릿
+
+```
+다음 텍스트를 바탕으로 객관식 문제 {questionCount}개를 만들어줘.
+
+규칙:
+1. 각 문제는 4개의 보기를 가진다.
+2. 정답은 1~4 중 하나의 번호로 표시한다.
+3. 반드시 아래 JSON 형식으로만 응답한다. 다른 텍스트는 포함하지 않는다.
+
+텍스트:
+{extractedText}
+
+응답 형식:
+[
+  {
+    "body": "문제 본문",
+    "options": ["보기1", "보기2", "보기3", "보기4"],
+    "answer": 1,
+    "explanation": "해설"
+  }
+]
+```
+
+### 응답 파싱
+
+```
+LLM 응답 문자열
+  └─ 정규식으로 JSON 배열 추출 (\[[\s\S]*\])
+       ├─ 파싱 성공 → questions 테이블에 저장
+       └─ 파싱 실패 → TEXT_EXTRACT_FAILED 에러 반환
+```
+
+---
+
+## 18. 인증 흐름 상세
+
+### JWT 구성
+
+| 항목 | 값 |
+|------|----|
+| Access Token 만료 | 1시간 |
+| Refresh Token 만료 | 30일 |
+| 서명 알고리즘 | HS256 |
+| Access Token 전달 | `Authorization: Bearer {token}` 헤더 |
+| Refresh Token 전달 | `HttpOnly` 쿠키 |
+
+### 토큰 갱신 시퀀스
+
+```
+[클라이언트]                         [서버]
+     │  API 요청 (만료된 토큰)         │
+     │ ──────────────────────────────► │
+     │  401 TOKEN_EXPIRED              │
+     │ ◄────────────────────────────── │
+     │                                 │
+     │  POST /api/auth/refresh         │
+     │  (쿠키의 Refresh Token 자동 전송)│
+     │ ──────────────────────────────► │
+     │  새 Access Token 발급           │
+     │ ◄────────────────────────────── │
+     │                                 │
+     │  원래 API 재요청                 │
+     │ ──────────────────────────────► │
+```
+
+- Axios 인터셉터에서 401 감지 → 자동 토큰 갱신 → 원래 요청 재시도
+- Refresh Token도 만료된 경우 → 로그인 페이지로 리다이렉트
+
+---
+
+## 19. 비로그인 세션 & 공유 토큰
+
+### 비로그인 세션
+
+- 퀴즈 데이터를 `sessionStorage['nq_quiz_{quizId}']` 키로 저장
+- 탭을 닫으면 자동 소멸
+- 구조:
+
+```json
+{
+  "quizId": "temp-uuid",
+  "questions": [...],
+  "createdAt": "2026-04-02T10:00:00Z"
+}
+```
+
+### 공유 토큰
+
+- 생성: `UUID.randomUUID()` 앞 6자리 (예: `xK92mP`)
+- 충돌 시 재생성 (최대 3회)
+- 만료 없음 — 퀴즈 삭제 시 함께 삭제
+- 공유 URL: `/share/{shareToken}`
+
+---
+
+## 20. 알림 스케줄러
+
+| 알림 종류 | 발송 수단 | 처리 방식 |
+|-----------|-----------|-----------|
+| 공부 리마인더 | 이메일 (JavaMailSender) | 매분 실행, `reminder_time` 일치 사용자 조회 후 발송 |
+| 오늘의 퀴즈 | 이메일 | 매분 실행, `daily_quiz_time` 일치 사용자 조회 후 문제 생성 및 발송 |
+
+```java
+@Scheduled(cron = "0 * * * * *")  // 매 분 0초마다 실행
+public void sendStudyReminders() { ... }
+```
+
+- 오늘의 퀴즈: 사용자 저장 파일 중 `RANDOM()` 1개 선택 → LLM 문제 생성 → 이메일 발송
+- 발송 실패 시 로그만 기록, 재시도 없음 (v1.0)
+
+---
+
+## 21. 에러 처리
+
+### 백엔드
+
+- `@RestControllerAdvice`로 전역 예외 핸들러 구성
+- 모든 에러는 15절의 공통 응답 형식으로 반환
+
+### 프론트엔드
+
+| 상황 | UX |
+|------|----|
+| 파일 형식 / 크기 오류 | 업로드 영역 아래 인라인 에러 메시지 |
+| 문제 생성 실패 | 모달 알림 + "다시 시도" 버튼 |
+| 네트워크 오류 | 토스트 메시지 |
+| 인증 만료 | Axios 인터셉터 자동 갱신 → 실패 시 로그인 페이지 이동 |
+
+---
+
+## 22. 환경 구성
+
+### 환경 변수
+
+**Backend** (`application.yml` 또는 `.env`)
+```
+DB_URL=jdbc:h2:file:./data/notequiz
+DB_USERNAME=sa
+DB_PASSWORD=
+
+JWT_SECRET=your-256-bit-secret
+JWT_ACCESS_EXPIRY=3600
+JWT_REFRESH_EXPIRY=2592000
+
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3
+OLLAMA_TIMEOUT=30
+
+MAIL_HOST=smtp.gmail.com
+MAIL_PORT=587
+MAIL_USERNAME=your@gmail.com
+MAIL_PASSWORD=app-password
+```
+
+**Frontend** (`.env`)
+```
+VITE_API_BASE_URL=http://localhost:8080
+```
+
+### 로컬 개발 환경 구성 순서
+
+```
+1. H2 스키마 자동 생성 (애플리케이션 시작 시 자동 처리)
+2. Ollama 설치 및 모델 pull
+     └─ ollama pull llama3
+3. Backend 실행
+     └─ 환경변수 주입 후 ./gradlew bootRun
+4. Frontend 실행
+     └─ npm install && npm run dev
+```
